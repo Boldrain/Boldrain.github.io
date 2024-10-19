@@ -1,0 +1,4 @@
+deploy:
+  type: git
+  repository: git@github.com:Boldrain/Boldrain.github.io.git
+  branch: main
