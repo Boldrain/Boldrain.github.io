@@ -708,63 +708,63 @@ static void erofsdump_extract_file(struct erofs_inode *vi, struct erofs_map_bloc
 		}
 	}
 }
-struct z_erofs_maprecorder {
-	struct erofs_inode *inode;
-	struct erofs_map_blocks *map;
-	void *kaddr;
+// struct z_erofs_maprecorder {
+// 	struct erofs_inode *inode;
+// 	struct erofs_map_blocks *map;
+// 	void *kaddr;
 
-	unsigned long lcn;
-	/* compression extent information gathered */
-	u8  type, headtype;
-	u16 clusterofs;
-	u16 delta[2];
-	erofs_blk_t pblk, compressedblks;
-	erofs_off_t nextpackoff;
-	bool partialref;
-};
+// 	unsigned long lcn;
+// 	/* compression extent information gathered */
+// 	u8  type, headtype;
+// 	u16 clusterofs;
+// 	u16 delta[2];
+// 	erofs_blk_t pblk, compressedblks;
+// 	erofs_off_t nextpackoff;
+// 	bool partialref;
+// };
 
-static void erofsdump_get_logical_len(struct erofs_inode *vi, struct erofs_map_blocks *map,
-									u64 block_num)
-{
-	int err;
-	u64 cur_block = 0;
-	unsigned long initial_lcn;
-	erofs_off_t chunk_size = 1U << vi->z_logical_clusterbits;
-	struct erofs_map_blocks an_map = {
-		.m_la = 0,
-	};
-	struct z_erofs_maprecorder m = {
-		.inode = vi,
-		.map = &an_map,
-		.kaddr = map->mpage,
-	};
+// static void erofsdump_get_logical_len(struct erofs_inode *vi, struct erofs_map_blocks *map,
+// 									u64 block_num)
+// {
+// 	int err;
+// 	u64 cur_block = 0;
+// 	unsigned long initial_lcn;
+// 	erofs_off_t chunk_size = 1U << vi->z_logical_clusterbits;
+// 	struct erofs_map_blocks an_map = {
+// 		.m_la = 0,
+// 	};
+// 	struct z_erofs_maprecorder m = {
+// 		.inode = vi,
+// 		.map = &an_map,
+// 		.kaddr = map->mpage,
+// 	};
 
-	while (map->m_la < vi->i_size) {
-		initial_lcn = map->m_la >> vi->z_logical_clusterbits;
-		err = z_erofs_load_cluster_from_disk(&m, initial_lcn, false);
-		switch (m.type) {
-		case Z_EROFS_LCLUSTER_TYPE_PLAIN:
-		case Z_EROFS_LCLUSTER_TYPE_HEAD1:
-			if (cur_block == dumpcfg.block_num) 
-				map->m_llen += chunk_size - m.clusterofs;
-			else if (cur_block == dumpcfg.block_num + 1)
-				map->m_llen += m.clusterofs;
-			cur_block += 1;
-			break;
-		case Z_EROFS_LCLUSTER_TYPE_NONHEAD:
-			if (cur_block == dumpcfg.block_num + 1)
-				map->m_llen += chunk_size;
-			break;
-		default:
+// 	while (map->m_la < vi->i_size) {
+// 		initial_lcn = map->m_la >> vi->z_logical_clusterbits;
+// 		err = z_erofs_load_cluster_from_disk(&m, initial_lcn, false);
+// 		switch (m.type) {
+// 		case Z_EROFS_LCLUSTER_TYPE_PLAIN:
+// 		case Z_EROFS_LCLUSTER_TYPE_HEAD1:
+// 			if (cur_block == dumpcfg.block_num) 
+// 				map->m_llen += chunk_size - m.clusterofs;
+// 			else if (cur_block == dumpcfg.block_num + 1)
+// 				map->m_llen += m.clusterofs;
+// 			cur_block += 1;
+// 			break;
+// 		case Z_EROFS_LCLUSTER_TYPE_NONHEAD:
+// 			if (cur_block == dumpcfg.block_num + 1)
+// 				map->m_llen += chunk_size;
+// 			break;
+// 		default:
 			
-			break;
-		}
-		map->m_la += chunk_size;
-	}
+// 			break;
+// 		}
+// 		map->m_la += chunk_size;
+// 	}
 	
-	fprintf(stdout, "llen: %lu\n", map->m_llen);
+// 	fprintf(stdout, "llen: %lu\n", map->m_llen);
 
-}						
+// }						
 
 static void erofsdump_extract_block(struct erofs_inode *vi, struct erofs_map_blocks *map,
 									int fd, bool compressed)
@@ -847,7 +847,7 @@ static void erofsdump_extract_block(struct erofs_inode *vi, struct erofs_map_blo
 	// 	// } while (map->m_llen);
 	// }
 
-	erofsdump_get_logical_len(vi, map, dumpcfg.block_num);
+	// erofsdump_get_logical_len(vi, map, dumpcfg.block_num);
 
 }
 
