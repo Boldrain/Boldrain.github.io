@@ -23,11 +23,15 @@ struct erofsdump_cfg {
 	unsigned int totalshow;
 	bool show_inode;
 	bool show_extent;
+	bool show_meta;
 	bool show_superblock;
 	bool show_statistics;
 	bool show_subdirectories;
+	bool extract_block;
 	erofs_nid_t nid;
+	u64 block_num;
 	const char *inode_path;
+	const char *extract_path;
 };
 static struct erofsdump_cfg dumpcfg;
 
@@ -80,6 +84,8 @@ static struct option long_options[] = {
 	{"path", required_argument, NULL, 4},
 	{"ls", no_argument, NULL, 5},
 	{"offset", required_argument, NULL, 6},
+	{"extract-path", required_argument, NULL, 7},
+	{"extract-block", required_argument, NULL, 8},
 	{0, 0, 0, 0},
 };
 
@@ -142,6 +148,9 @@ static int erofsdump_parse_options_cfg(int argc, char **argv)
 	while ((opt = getopt_long(argc, argv, "SVesh",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
+		case 'm':
+			dumpcfg.show_meta = true;
+			++dumpcfg.totalshow;
 		case 'e':
 			dumpcfg.show_extent = true;
 			++dumpcfg.totalshow;
@@ -185,6 +194,12 @@ static int erofsdump_parse_options_cfg(int argc, char **argv)
 				erofs_err("invalid disk offset %s", optarg);
 				return -EINVAL;
 			}
+			break;
+		case 7:
+			dumpcfg.extract_path = optarg;
+			break;
+		case 8:
+			dumpcfg.block_num = atol(optarg);
 			break;
 		default:
 			return -EINVAL;
@@ -361,6 +376,76 @@ static int erofsdump_map_blocks(struct erofs_inode *inode,
 	return erofs_map_blocks(inode, map, flags);
 }
 
+static void erofsdump_show_extent_full(struct erofs_inode *vi)
+{
+	erofs_off_t meta_base = Z_EROFS_FULL_INDEX_ALIGN(erofs_iloc(vi) +
+			vi->inode_isize + vi->xattr_isize);
+	unsigned long lcn = (vi->i_size + vi->z_logical_clusterbits - 1) >> vi->z_logical_clusterbits;
+	fprintf(stdout, "%10" PRIu64 "..%10" PRIu64 " | %7" PRIu64 "\n",
+			meta_base, meta_base + (lcn * sizeof(struct z_erofs_lcluster_index)),
+			lcn * sizeof(struct z_erofs_lcluster_index));
+		
+	fprintf(stdout, "There are %lu index blocks\n", lcn);
+	fprintf(stdout, "Index blocks are not compacted\n");
+
+	return;
+}
+
+static void erofsdump_show_extent_compacted(struct erofs_inode *vi)
+{
+	struct erofs_sb_info *sbi = vi->sbi;
+	unsigned long lcn = (vi->i_size + (1 << vi->z_logical_clusterbits) - 1) >> vi->z_logical_clusterbits;
+	unsigned long initial_lcn = lcn;
+	const erofs_off_t ebase = round_up(erofs_iloc(vi) + vi->inode_isize +
+					   vi->xattr_isize, 8) +
+		sizeof(struct z_erofs_map_header);
+	const unsigned int totalidx = BLK_ROUND_UP(sbi, vi->i_size);
+	unsigned int compacted_4b_initial, compacted_2b;
+	unsigned int amortizedshift;
+	erofs_off_t pos;
+
+
+	// if (lcn >= totalidx)
+	// 	fprintf(stdout, "error?");
+	/* used to align to 32-byte (compacted_2b) alignment */
+	compacted_4b_initial = (32 - ebase % 32) / 4;
+	if (compacted_4b_initial == 32 / 4)
+		compacted_4b_initial = 0;
+
+	if ((vi->z_advise & Z_EROFS_ADVISE_COMPACTED_2B) &&
+	    compacted_4b_initial < totalidx)
+		compacted_2b = rounddown(totalidx - compacted_4b_initial, 16);
+	else
+		compacted_2b = 0;
+
+	pos = ebase;
+	if (lcn < compacted_4b_initial) {
+		amortizedshift = 2;
+		goto out;
+	}
+	pos += compacted_4b_initial * 4;
+	lcn -= compacted_4b_initial;
+
+	if (lcn < compacted_2b) {
+		amortizedshift = 1;
+		goto out;
+	}
+	pos += compacted_2b * 2;
+	lcn -= compacted_2b;
+	amortizedshift = 2;
+out:
+	pos += lcn * (1 << amortizedshift);
+	
+	fprintf(stdout, "%10" PRIu64 "..%10" PRIu64 " | %7" PRIu64 "\n",
+			ebase - sizeof(struct z_erofs_map_header), pos,
+			pos - (ebase - sizeof(struct z_erofs_map_header)));
+		
+	fprintf(stdout, "There are %lu index blocks\n", initial_lcn);
+	fprintf(stdout, "Index blocks are compacted\n");
+
+	return;
+}
+
 static void erofsdump_show_fileinfo(bool show_extent)
 {
 	const char *ext_fmt[] = {
@@ -487,6 +572,355 @@ static void erofsdump_show_fileinfo(bool show_extent)
 	}
 	fprintf(stdout, "%s: %d extents found\n",
 		erofs_is_packed_inode(&inode) ? "(packed file)" : path, extent_count);
+
+	
+	if (!dumpcfg.show_meta)
+		return;
+	if (erofs_inode_is_data_compressed(inode.datalayout)) {
+		fprintf(stdout, "   physical offset    |  length\n");
+		
+		if (inode.datalayout == EROFS_INODE_COMPRESSED_FULL) {
+			erofsdump_show_extent_full(&inode);
+		}
+	
+		if (inode.datalayout == EROFS_INODE_COMPRESSED_COMPACT) {
+			erofsdump_show_extent_compacted(&inode);
+		}
+	}
+	
+	return;
+}
+
+static void erofsdump_extract_file(struct erofs_inode *vi, struct erofs_map_blocks *map,
+									int fd, bool compressed)
+{
+	erofs_off_t pos = 0;
+	int ret;
+	unsigned int raw_size = 0, buffer_size = 0;
+	char *raw = NULL, *buffer = NULL;
+
+	while (pos < vi->i_size) {
+		// fprintf(stdout, "plen:%u", erofs_pos(sbi, lastblk) - offset);
+		
+		unsigned int alloc_rawsize;
+
+		map->m_la = pos;
+		if (compressed)
+			ret = z_erofs_map_blocks_iter(vi, map,
+					EROFS_GET_BLOCKS_FIEMAP);
+		else
+			ret = erofs_map_blocks(vi, map,
+					EROFS_GET_BLOCKS_FIEMAP);
+		// if (ret)
+		// 	goto out;
+
+		if (!compressed && map->m_llen != map->m_plen) {
+			erofs_err("broken chunk length m_la %" PRIu64 " m_llen %" PRIu64 " m_plen %" PRIu64,
+				  map->m_la, map->m_llen, map->m_plen);
+			ret = -EFSCORRUPTED;
+			// goto out;
+		}
+
+		/* the last lcluster can be divided into 3 parts */
+		if (map->m_la + map->m_llen > vi->i_size)
+			map->m_llen = vi->i_size - map->m_la;
+
+		// pchunk_len += map->m_plen;
+		pos += map->m_llen;
+
+		/* should skip decomp? */
+		// if (map->m_la >= vi->i_size || !fsckcfg.check_decomp)
+		// 	continue;
+
+		if (fd >= 0 && !(map->m_flags & EROFS_MAP_MAPPED)) {
+			ret = lseek(fd, map->m_llen, SEEK_CUR);
+			// if (ret < 0) {
+			// 	ret = -errno;
+			// 	goto out;
+			// }
+			// continue;
+		}
+
+		if (map->m_plen > Z_EROFS_PCLUSTER_MAX_SIZE) {
+			if (compressed) {
+				erofs_err("invalid pcluster size %" PRIu64 " @ offset %" PRIu64 " of nid %" PRIu64,
+					  map->m_plen, map->m_la,
+					  vi->nid | 0ULL);
+				ret = -EFSCORRUPTED;
+				// goto out;
+			}
+			alloc_rawsize = Z_EROFS_PCLUSTER_MAX_SIZE;
+		} else {
+			alloc_rawsize = map->m_plen;
+		}
+		fprintf(stdout, "chunk_size: %u", 1U << vi->z_logical_clusterbits);
+		fprintf(stdout, "plen: %lu\t", map->m_plen);
+		fprintf(stdout, "llen: %lu\t", map->m_llen);
+		fprintf(stdout, "ondisksize: %lu\n", vi->i_size);
+		if (alloc_rawsize > raw_size) {
+			char *newraw = realloc(raw, alloc_rawsize);
+
+			if (!newraw) {
+				ret = -ENOMEM;
+				// goto out;
+			}
+			raw = newraw;
+			raw_size = alloc_rawsize;
+		}
+
+		if (compressed) {
+			if (map->m_llen > buffer_size) {
+				char *newbuffer;
+
+				buffer_size = map->m_llen;
+				newbuffer = realloc(buffer, buffer_size);
+				if (!newbuffer) {
+					ret = -ENOMEM;
+					// goto out;
+				}
+				buffer = newbuffer;
+			}
+			ret = z_erofs_read_one_data(vi, map, raw, buffer,
+						    0, map->m_llen, false);
+			// if (ret)
+			// 	goto out;
+
+			write(fd, buffer, map->m_llen);
+			// if (outfd >= 0 && write(outfd, buffer, map->m_llen) < 0)
+			// 	goto fail_eio;
+		} else {
+			u64 p = 0;
+
+			do {
+				u64 count = min_t(u64, alloc_rawsize,
+						  map->m_llen);
+
+				ret = erofs_read_one_data(vi, map, raw, p, count);
+				// if (ret)
+				// 	goto out;
+
+				write(fd, raw, count);
+				// if (outfd >= 0 && write(outfd, raw, count) < 0)
+				// 	goto fail_eio;
+				map->m_llen -= count;
+				p += count;
+			} while (map->m_llen);
+		}
+	}
+}
+struct z_erofs_maprecorder {
+	struct erofs_inode *inode;
+	struct erofs_map_blocks *map;
+	void *kaddr;
+
+	unsigned long lcn;
+	/* compression extent information gathered */
+	u8  type, headtype;
+	u16 clusterofs;
+	u16 delta[2];
+	erofs_blk_t pblk, compressedblks;
+	erofs_off_t nextpackoff;
+	bool partialref;
+};
+
+static void erofsdump_get_logical_len(struct erofs_inode *vi, struct erofs_map_blocks *map,
+									u64 block_num)
+{
+	int err;
+	u64 cur_block = 0;
+	unsigned long initial_lcn;
+	erofs_off_t chunk_size = 1U << vi->z_logical_clusterbits;
+	struct erofs_map_blocks an_map = {
+		.m_la = 0,
+	};
+	struct z_erofs_maprecorder m = {
+		.inode = vi,
+		.map = &an_map,
+		.kaddr = map->mpage,
+	};
+
+	while (map->m_la < vi->i_size) {
+		initial_lcn = map->m_la >> vi->z_logical_clusterbits;
+		err = z_erofs_load_cluster_from_disk(&m, initial_lcn, false);
+		switch (m.type) {
+		case Z_EROFS_LCLUSTER_TYPE_PLAIN:
+		case Z_EROFS_LCLUSTER_TYPE_HEAD1:
+			if (cur_block == dumpcfg.block_num) 
+				map->m_llen += chunk_size - m.clusterofs;
+			else if (cur_block == dumpcfg.block_num + 1)
+				map->m_llen += m.clusterofs;
+			cur_block += 1;
+			break;
+		case Z_EROFS_LCLUSTER_TYPE_NONHEAD:
+			if (cur_block == dumpcfg.block_num + 1)
+				map->m_llen += chunk_size;
+			break;
+		default:
+			
+			break;
+		}
+		map->m_la += chunk_size;
+	}
+	
+	fprintf(stdout, "llen: %lu\n", map->m_llen);
+
+}						
+
+static void erofsdump_extract_block(struct erofs_inode *vi, struct erofs_map_blocks *map,
+									int fd, bool compressed)
+{
+	// erofs_off_t size, chunk_size;
+	// int ret;
+	// map->m_la = 0;
+
+	// if (compressed)
+	// 	ret = z_erofs_map_blocks_iter(vi, map,
+	// 			EROFS_GET_BLOCKS_FIEMAP);
+	// else
+	// 	ret = erofs_map_blocks(vi, map,
+	// 			EROFS_GET_BLOCKS_FIEMAP);
+	
+	// erofs_get_occupied_size(vi, &size);
+	// chunk_size = 1U << vi->z_logical_clusterbits;
+
+	// map->m_pa += dumpcfg.block_num * chunk_size;
+	// if (size - map->m_pa >= chunk_size)
+	// 	map->m_plen = chunk_size;
+	// else
+	// 	map->m_plen = size - map->m_pa;
+
+	// if (compressed) {
+	// 	struct erofs_map_dev mdev = (struct erofs_map_dev) {
+	// 		.m_pa = map->m_pa,
+	// 	};
+	// 	struct erofs_sb_info *sbi = vi->sbi;
+
+	// 	char *raw = malloc(map->m_plen);
+	// 	char *buffer = malloc(map->m_llen);
+
+
+	// 	ret = erofs_map_dev(sbi, &mdev);
+	// 	if (ret) {
+	// 		DBG_BUGON(1);
+	// 		return ret;
+	// 	}
+
+	// 	ret = erofs_dev_read(sbi, mdev.m_deviceid, raw, mdev.m_pa, map->m_plen);
+	// 	if (ret < 0)
+	// 		return ret;
+
+	// 	ret = z_erofs_decompress(&(struct z_erofs_decompress_req) {
+	// 			.sbi = sbi,
+	// 			.in = raw,
+	// 			.out = buffer,
+	// 			.decodedskip = 0,
+	// 			.interlaced_offset =
+	// 				map->m_algorithmformat == Z_EROFS_COMPRESSION_INTERLACED ?
+	// 					erofs_blkoff(sbi, map->m_la) : 0,
+	// 			.inputsize = map->m_plen,
+	// 			.decodedlength = map->m_llen,
+	// 			.alg = map->m_algorithmformat,
+	// 			.partial_decoding = !(map->m_flags & EROFS_MAP_FULL_MAPPED) ||
+	// 								(map->m_flags & EROFS_MAP_PARTIAL_REF),
+	// 			});
+		
+	// } else {
+	// 	u64 p = 0;
+
+	// 	char *raw = malloc(map->m_plen);
+	// 	ret = erofs_read_one_data(vi, map, raw, p, map->m_plen);
+	// 	write(fd, raw, map->m_plen);
+
+
+	// 	// do {
+	// 	// 	u64 count = map->m_plen;
+
+	// 	// 	ret = erofs_read_one_data(vi, map, raw, p, count);
+	// 	// 	// if (ret)
+	// 	// 	// 	goto out;
+
+	// 	// 	write(fd, raw, count);
+	// 	// 	// if (outfd >= 0 && write(outfd, raw, count) < 0)
+	// 	// 	// 	goto fail_eio;
+	// 	// 	map->m_llen -= count;
+	// 	// 	p += count;
+	// 	// } while (map->m_llen);
+	// }
+
+	erofsdump_get_logical_len(vi, map, dumpcfg.block_num);
+
+}
+
+static void erofsdump_file_extract()
+{
+	int err, fd;
+	int ret = 0;
+	bool compressed;
+	u64 block_num = 0;
+	struct erofs_inode inode = { .sbi = &g_sbi, .nid = dumpcfg.nid };
+	erofs_off_t size;
+	
+	char path[PATH_MAX];
+
+	struct erofs_map_blocks map = {
+		.index = UINT_MAX,
+		.m_la = 0,
+	};
+
+	if (dumpcfg.inode_path) {
+		err = erofs_ilookup(dumpcfg.inode_path, &inode);
+		if (err) {
+			erofs_err("read inode failed @ %s", dumpcfg.inode_path);
+			return;
+		}
+	} else {
+		err = erofs_read_inode_from_disk(&inode);
+		if (err) {
+			erofs_err("read inode failed @ nid %llu",
+				  inode.nid | 0ULL);
+			return;
+		}
+	}
+	err = erofs_get_occupied_size(&inode, &size);
+	if (err) {
+		erofs_err("get file size failed @ nid %llu", inode.nid | 0ULL);
+		return;
+	}
+
+	err = erofs_get_pathname(inode.sbi, inode.nid, path, sizeof(path));
+	if (err < 0) {
+		strncpy(path, "(not found)", sizeof(path) - 1);
+		path[sizeof(path) - 1] = '\0';
+	}
+
+	switch (inode.datalayout) {
+	case EROFS_INODE_FLAT_PLAIN:
+	case EROFS_INODE_FLAT_INLINE:
+	case EROFS_INODE_CHUNK_BASED:
+		compressed = false;
+		break;
+	case EROFS_INODE_COMPRESSED_FULL:
+	case EROFS_INODE_COMPRESSED_COMPACT:
+		compressed = true;
+		break;
+	default:
+		erofs_err("unknown datalayout");
+		return -EINVAL;
+	}
+
+	fd = open(dumpcfg.extract_path,
+		O_WRONLY | O_CREAT | O_NOFOLLOW , 0700);
+	if (fd < 0) {
+		fprintf(stdout, "path somehow wrong\n");
+		return;
+	}
+
+	if (!dumpcfg.extract_block) {
+		erofsdump_extract_file(&inode, &map, fd, compressed);
+	} else {
+		erofsdump_extract_block(&inode, &map, fd, compressed);
+	}
+
 }
 
 static void erofsdump_filesize_distribution(const char *title,
@@ -713,6 +1147,9 @@ int main(int argc, char **argv)
 
 	if (dumpcfg.show_inode)
 		erofsdump_show_fileinfo(dumpcfg.show_extent);
+
+		if (dumpcfg.extract_path && dumpcfg.show_inode)
+		erofsdump_file_extract();
 
 exit_put_super:
 	erofs_put_super(&g_sbi);
